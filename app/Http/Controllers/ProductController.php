@@ -11,7 +11,7 @@ class ProductController extends Controller
 {
     public function index()
     {
-        $products = Product::all();
+        $products = Product::with('category')->paginate(15);
 
         $result = [];
         foreach ($products as $product) {
@@ -22,14 +22,14 @@ class ProductController extends Controller
                 'stock'    => $product->stock,
                 'category' => $product->category->name,
             ];
-        }
+        } 
 
         return response()->json($result);
     }
 
     public function salesReport()
     {
-        $orders = Order::all();
+        $orders = Order::with(['items.product', 'customer'])->paginate(15);
 
         $report = [];
         foreach ($orders as $order) {
