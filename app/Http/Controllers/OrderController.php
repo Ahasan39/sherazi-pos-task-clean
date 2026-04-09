@@ -97,12 +97,18 @@ class OrderController extends Controller
 
     public function filterByStatus(Request $request)
     {
+        // ✅ FIX #6 SECURITY: Only allow these 3 values
+        $request->validate([
+            'status' => 'required|in:pending,completed,cancelled',
+        ]);
+
         $status = $request->input('status');
-        // ✅ FIX #3 & #6: Use Eloquent and paginate(15)
-        // This also fixes the SQL Injection risk
+
         $orders = Order::where('status', $status)
                     ->with(['customer', 'items'])
                     ->paginate(15);
+
         return response()->json($orders);
     }
+
 }
