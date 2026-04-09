@@ -52,28 +52,31 @@ class OrderController extends Controller
     public function index()
     {
         $orders = Order::with('customer','items')->paginate(15);
-
-        $data = [];
-        foreach ($orders as $order) {
-            $data[] = [
-                'id'          => $order->id,
-                'customer'    => $order->customer->name,
-                'total'       => $order->total_amount,
-                'status'      => $order->status,
-                'items_count' => $order->items->count(),
-                'created_at'  => $order->created_at,
-            ];
-        }
-
-        return response()->json($data);
+        $data = $orders->getCollection()->map(fn($order) => [
+            'id'          => $order->id,
+            'customer'    => $order->customer->name,
+            'total'       => $order->total_amount,
+            'status'      => $order->status,
+            'items_count' => $order->items->count(),
+            'created_at'  => $order->created_at,
+        ]);
+        // ✅ FIX #3: Return pagination metadata
+        return response()->json([
+            'data'         => $data,
+            'current_page' => $orders->currentPage(),
+            'total'        => $orders->total(),
+            'last_page'    => $orders->lastPage(),
+        ]);
     }
 
     public function filterByStatus(Request $request)
     {
         $status = $request->input('status');
-
-        $orders = DB::select("SELECT * FROM orders WHERE status = '$status'");
-
+        // ✅ FIX #3 & #6: Use Eloquent and paginate(15)
+        // This also fixes the SQL Injection risk
+        $orders = Order::where('status', $status)
+                    ->with(['customer', 'items'])
+                    ->paginate(15);
         return response()->json($orders);
     }
 }

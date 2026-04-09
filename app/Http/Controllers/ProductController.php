@@ -39,21 +39,22 @@ class ProductController extends Controller
     public function salesReport()
     {
         $orders = Order::with(['items.product', 'customer'])->paginate(15);
-
-        $report = [];
-        foreach ($orders as $order) {
-            foreach ($order->items as $item) {
-                $report[] = [
-                    'order_id'     => $order->id,
-                    'product_name' => $item->product->name,
-                    'qty'          => $item->quantity,
-                    'total'        => $item->quantity * $item->product->price,
-                    'customer'     => $order->customer->name,
-                ];
-            }
-        }
-
-        return response()->json($report);
+        $report = $orders->getCollection()->map(function ($order) {
+            return $order->items->map(fn($item) => [
+                'order_id'     => $order->id,
+                'product_name' => $item->product->name,
+                'qty'          => $item->quantity,
+                'total'        => $item->quantity * $item->product->price,
+                'customer'     => $order->customer->name,
+            ]);
+        })->flatten(1);
+        // Return the pagination stats along with the data
+        return response()->json([
+            'data'         => $report,
+            'current_page' => $orders->currentPage(),
+            'total'        => $orders->total(),
+            'last_page'    => $orders->lastPage(),
+        ]);
     }
 
     public function dashboard()
@@ -74,11 +75,12 @@ class ProductController extends Controller
 
     public function search(Request $request)
     {
-        $keyword  = $request->input('q');
+        $keyword = $request->input('q');
+        
+        // ✅ FIX #3: Replace ->get() with ->paginate(15)
         $products = Product::where('name', 'LIKE', '%' . $keyword . '%')
-                           ->orWhere('description', 'LIKE', '%' . $keyword . '%')
-                           ->get();
-
+                        ->orWhere('description', 'LIKE', '%' . $keyword . '%')
+                        ->paginate(15);
         return response()->json($products);
     }
 
