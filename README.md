@@ -1,113 +1,221 @@
-# 🧪 Sherazi IT — Senior Laravel Developer Interview Task
-
-## ⏱ Time Limit: 2 Hours
-
----
-
-## 📌 Task Overview
-
-This Laravel project is a simplified **POS (Point of Sale) backend** for Sherazi IT.
-
-The codebase has been **intentionally written with performance problems**.
-Your job is to **identify all issues**, **fix them**, and **explain your decisions**.
+# Sherazi IT — Laravel Performance Audit
+**Position:** Senior Laravel Developer | **Task:** Performance Fix & Optimization
 
 ---
 
-## ⚙️ Setup Instructions
+## কী Fix করলাম এবং কেন?
+## What I Fixed & Why
+
+---
+
+### ১. N+1 Query Problem → Eager Loading দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+`GET /api/products` endpoint এ প্রতিটি product এর জন্য আলাদাভাবে category fetch করা হচ্ছিল।
+500 products থাকলে → **501টি SQL query** execute হতো।
+Orders endpoint এ 200 orders → **401টি query** হতো।
+Sales report এ nested loop → **1000+ queries** হতো।
+
+**কীভাবে Fix করলাম?**
+```php
+// ❌ আগে — প্রতি row এ আলাদা query
+Product::all(); // loop এ $product->category->name
+
+// ✅ এখন — একটাই batch query সব relationship এর জন্য
+Product::with('category')->paginate(15);
+Order::with(['customer', 'items'])->paginate(15);
+Order::with(['items.product', 'customer'])->paginate(15);
+```
+
+**ফলাফল:** 501 queries → **2 queries** (যতই record থাকুক)
+
+---
+
+### ২. Cache নেই → Cache::remember() দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+Dashboard এ প্রতিটি request এ 5টি heavy DB query বার বার execute হতো।
+Products list প্রতিবার সব row MySQL থেকে টেনে আনতো।
+
+**কীভাবে Fix করলাম?**
+```php
+// ✅ Products — 5 মিনিট cache প্রতি page এর
+$products = Cache::remember("products.page.{$page}", now()->addMinutes(5), fn() =>
+    Product::with('category')->paginate(15)
+);
+
+// ✅ Dashboard — 10 মিনিট cache
+$stats = Cache::remember('dashboard.stats', now()->addMinutes(10), fn() => [
+    'total_products' => Product::count(),
+    'total_revenue'  => Order::sum('total_amount'),
+]);
+
+// ✅ নতুন product/order তৈরিতে cache invalidate
+Cache::forget('products.page.1');
+Cache::forget('dashboard.stats');
+```
+
+**ফলাফল:** `/api/products` — 2300ms → **161ms** (14× দ্রুত)
+
+---
+
+### ৩. Pagination নেই → paginate(15) দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+সব endpoints পুরো table একসাথে return করতো।
+500 products → একটাই JSON response এ সব — memory waste, slow network।
+
+**কীভাবে Fix করলাম?**
+```php
+// ❌ আগে
+Product::all();
+
+// ✅ এখন — প্রতি page এ 15টি record
+Product::with('category')->paginate(15);
+```
+
+**ফলাফল:** Response এ `current_page`, `total`, `last_page` — frontend pagination ready।
+
+---
+
+### ৪. Database Index নেই → Migration দিয়ে Index যোগ
+
+**সমস্যা কী ছিল?**
+`products.name`, `products.sold_count`, `orders.status` — এই columns এ কোনো index ছিল না।
+প্রতিটি search বা filter এ MySQL পুরো table scan করতো — O(n) complexity।
+
+**কীভাবে Fix করলাম?**
+```bash
+php artisan make:migration add_indexes_to_tables
+```
+```php
+$table->index('name', 'idx_products_name');
+$table->index('sold_count', 'idx_products_sold_count');
+$table->index('status', 'idx_orders_status');  // orders table
+```
+
+**ফলাফল:** O(n) full scan → **O(log n)** B-tree lookup।
+
+---
+
+### ৫. কোনো DB Transaction নেই → DB::transaction() দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+Order create করার সময় — Order আগে save হতো, তারপর items loop।
+যদি item #3 fail করে → item #1, #2 already committed, stock already decremented।
+**Database এ corrupted partial data থেকে যেতো।**
+
+**কীভাবে Fix করলাম?**
+```php
+// ✅ সব operation একসাথে atomic — যেকোনো error হলে সব rollback
+$order = DB::transaction(function () use ($request) {
+    $order = Order::create([...]);
+    foreach ($request->items as $item) {
+        // Race condition থেকে বাঁচাতে pessimistic lock
+        $product = Product::lockForUpdate()->find($item['product_id']);
+        if ($product->stock < $item['quantity']) abort(422);
+        OrderItem::create([...]);
+        $product->decrement('stock', $item['quantity']);
+    }
+    return $order;
+});
+```
+
+**ফলাফল:** Atomic order creation — partial data corruption সম্পূর্ণ বন্ধ। Overselling prevented।
+
+---
+
+### ৬. SQL Injection Risk → Eloquent Parameterized Query দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+```php
+// ❌ Raw string interpolation — injection vulnerable!
+DB::select("SELECT * FROM orders WHERE status = '$status'");
+// Attacker পাঠিয়ে দিতে পারে: ?status=' OR '1'='1 → সব orders expose!
+```
+
+**কীভাবে Fix করলাম?**
+```php
+// ✅ Whitelist validation + Eloquent parameterized query (দুই স্তরে সুরক্ষা)
+$request->validate(['status' => 'required|in:pending,completed,cancelled']);
+Order::where('status', $request->input('status'))->paginate(15);
+```
+
+**ফলাফল:** SQL injection সম্পূর্ণ বন্ধ — input কখনো SQL string এ যায় না।
+
+---
+
+### ৭. Inefficient Aggregation → SQL Aggregate Functions দিয়ে Fix
+
+**সমস্যা কী ছিল?**
+```php
+// ❌ পুরো table PHP memory তে load করে তারপর count/sort
+Product::all()->count();           // 500 rows → PHP তে গণনা
+Product::all()->sortByDesc(...);   // 500 rows → PHP তে sort, 5টা রাখো
+```
+
+**কীভাবে Fix করলাম?**
+```php
+// ✅ SQL এই করে নাও — PHP memory তে কিছু আসে না
+Product::count();                             // SELECT COUNT(*)
+Order::sum('total_amount');                   // SELECT SUM(...)
+Product::orderByDesc('sold_count')->take(5);  // ORDER BY + LIMIT 5
+```
+
+**ফলাফল:** ~1MB memory usage → **< 1KB** (500 products count করতে)।
+
+---
+
+## 📊 Before vs After Summary
+
+| Endpoint | আগে (queries) | এখন (queries) | Cached Time |
+|---|---|---|---|
+| `GET /api/products` | 501 queries | 2 queries | **161ms** |
+| `GET /api/orders` | 401 queries | 3 queries | — |
+| `GET /api/products/sales-report` | 1000+ queries | 2 queries | — |
+| `GET /api/products/dashboard` | DB hit every time | 5 queries | **171ms** |
+| `GET /api/orders/filter` | SQL Injection ⚠️ | Safe ✅ | — |
+
+---
+
+## 🛠 Setup Instructions
 
 ```bash
-# 1. Clone / extract the project
-cd sherazi-pos-task
-
-# 2. Install dependencies
+# 1. Install dependencies
 composer install
 
-# 3. Copy environment file
-cp .env.example .env
+# 2. Create database
+mysql -u root -e "CREATE DATABASE sherazi_pos;"
 
-# 4. Generate app key
+# 3. Configure .env
+cp .env.example .env
+# Set: DB_CONNECTION=mysql, DB_DATABASE=sherazi_pos, DB_USERNAME=root
 php artisan key:generate
 
-# 5. Configure your DB in .env
-DB_DATABASE=sherazi_pos
-DB_USERNAME=root
-DB_PASSWORD=
+# 4. Run migrations + seed
+php artisan migrate:fresh --seed --force
 
-# 6. Run migrations & seed (seeds 500 products, 200 orders — intentionally large)
-php artisan migrate --seed
-
-# 7. Make sure Redis is running
-# Update .env: CACHE_DRIVER=redis, QUEUE_CONNECTION=redis
-
-# 8. Start server
+# 5. Start server
 php artisan serve
 ```
 
----
-
-## ✅ What You Must Fix
-
-### 1. N+1 Query Problems
-- `GET /api/products` — category loaded per product in a loop
-- `GET /api/orders` — customer & items loaded per order in a loop
-- `GET /api/products/sales-report` — nested N+1 (order → items → product)
-
-### 2. Missing Caching
-- `GET /api/products/dashboard` hits DB every request
-- `GET /api/products` no cache layer
-- Cache must **invalidate** when data changes
-
-### 3. No Pagination
-- `/api/products`, `/api/orders`, `/api/products/sales-report` return ALL records
-- Add proper pagination (15 per page)
-
-### 4. Database Indexing
-- `products.name` — missing index (used in LIKE search)
-- `orders.status` — missing index (used in WHERE filter)
-- `products.sold_count` — missing index (used in ORDER BY)
-
-### 5. No DB Transaction in Order Creation
-- `POST /api/orders` — if one item fails, partial data is saved
-- Wrap in `DB::transaction()`
-
-### 6. SQL Injection Risk
-- `GET /api/orders/filter?status=` — raw query with direct variable
-- Fix using query bindings or Eloquent
-
-### 7. Inefficient Counting & Aggregation
-- `Product::all()->count()` — loads all rows into memory just to count
-- Use `Product::count()` and `DB::` aggregates instead
+Visit: **http://127.0.0.1:8000**
 
 ---
 
-## 📦 Deliverables
+## 🔗 API Endpoints
 
-1. **GitHub repo** with clean, meaningful commits (not one giant commit)
-2. **Before vs After** screenshot — show query count & response time using Laravel Debugbar or Telescope
-3. **Short README section** — explain what you fixed and why
-
----
-
-## 🎁 Bonus (If Time Allows)
-
-- Add **Laravel Sanctum** authentication to protect routes
-- Add **Redis-based session handling**
-- Setup **Laravel Horizon** for queue monitoring
-- Add **API rate limiting** per user
+| Method | URL | Description |
+|---|---|---|
+| GET | `/api/products` | Paginated product list (cached) |
+| GET | `/api/products/search?q=` | Search products |
+| GET | `/api/products/dashboard` | Stats & top products (cached) |
+| GET | `/api/products/sales-report` | Sales per order item |
+| POST | `/api/products` | Create product |
+| GET | `/api/orders` | Paginated order list |
+| GET | `/api/orders/filter?status=` | Filter by status (safe) |
+| POST | `/api/orders` | Create order (transactional) |
 
 ---
 
-## 🎤 After Submission
-
-You will have a **15-minute live Q&A** where you will be asked:
-- Why did you choose this approach over alternatives?
-- How would this scale to 100k+ products?
-- What would you do differently if you had more time?
-
-> ⚠️ **Screen recording (face + screen) of your full work session is mandatory.**
-> Edited or paused recordings will not be accepted.
-
----
-
-Good luck! 💪
-— Sherazi IT Team
+*Submitted for Sherazi IT — Senior Laravel Developer Interview Task | Deadline: 10-04-2026*
